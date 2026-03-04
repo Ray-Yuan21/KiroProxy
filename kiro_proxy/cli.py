@@ -57,38 +57,80 @@ def cmd_accounts_export(args):
 def cmd_accounts_import(args):
     """导入账号配置"""
     import uuid
+    from datetime import datetime, timezone, timedelta
     from .core import state, Account
     from .auth import save_credentials_to_file
+    from .credential import TokenRefresher
     
     data = json.loads(Path(args.file).read_text())
-    accounts_data = data.get("accounts", [])
+    
+    # 支持两种格式：
+    # 1. {"accounts": [...]} - 标准导出格式
+    # 2. [...] - 简化数组格式（直接包含凭证）
+    if isinstance(data, list):
+        accounts_data = data
+    else:
+        accounts_data = data.get("accounts", [])
+    
     imported = 0
     
     for acc_data in accounts_data:
-        creds = acc_data.get("credentials", {})
-        if not creds.get("accessToken"):
-            print(f"跳过 {acc_data.get('name', '未知')}: 缺少 accessToken")
+        # 支持两种凭证格式：
+        # 1. {"credentials": {...}} - 标准格式
+        # 2. 直接包含 accessToken 等字段 - 简化格式
+        if "credentials" in acc_data:
+            creds = acc_data.get("credentials", {})
+        else:
+            creds = acc_data
+        
+        if not creds.get("accessToken") and not creds.get("refreshToken"):
+            print(f"跳过 {acc_data.get('name', '未知')}: 缺少 accessToken 和 refreshToken")
             continue
+        
+        # 如果没有 expiresAt，设置为当前时间（标记为已过期，需要刷新）
+        expires_at = creds.get("expiresAt")
+        if not expires_at:
+            # 设置为已过期，触发自动刷新
+            expires_at = (datetime.now(timezone.utc) - timedelta(hours=1)).isoformat()
         
         # 保存凭证到文件
         file_path = asyncio.run(save_credentials_to_file({
             "accessToken": creds.get("accessToken"),
             "refreshToken": creds.get("refreshToken"),
-            "expiresAt": creds.get("expiresAt"),
+            "expiresAt": expires_at,
             "region": creds.get("region", "us-east-1"),
             "authMethod": creds.get("authMethod", "social"),
+            "clientId": creds.get("clientId"),
+            "clientSecret": creds.get("clientSecret"),
+            "provider": creds.get("provider", "BuilderId"),
+            "machineId": creds.get("machineId", ""),
         }, f"imported-{uuid.uuid4().hex[:8]}"))
         
         account = Account(
             id=uuid.uuid4().hex[:8],
-            name=acc_data.get("name", "导入账号"),
+            name=acc_data.get("name", f"导入账号-{creds.get('region', 'unknown')}"),
             token_path=file_path,
             enabled=acc_data.get("enabled", True)
         )
         state.accounts.append(account)
         account.load_credentials()
+        
+        # 如果有 refreshToken，尝试立即刷新
+        if creds.get("refreshToken") and account.credentials:
+            try:
+                refresher = TokenRefresher(account.credentials)
+                success, result = asyncio.run(refresher.refresh())
+                if success:
+                    account.credentials.save_to_file(file_path)
+                    print(f"✓ 已导入并刷新: {account.name}")
+                else:
+                    print(f"✓ 已导入但刷新失败: {account.name} - {result}")
+            except Exception as e:
+                print(f"✓ 已导入但刷新异常: {account.name} - {e}")
+        else:
+            print(f"✓ 已导入: {account.name}")
+        
         imported += 1
-        print(f"已导入: {account.name}")
     
     state._save_accounts()
     print(f"\n共导入 {imported} 个账号")

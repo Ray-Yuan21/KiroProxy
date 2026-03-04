@@ -802,38 +802,96 @@ async def export_accounts():
 
 async def import_accounts(request: Request):
     """导入账号配置"""
+    from ..credential import TokenRefresher
+    from datetime import datetime, timezone, timedelta
+    
     body = await request.json()
-    accounts_data = body.get("accounts", [])
+    
+    # 支持两种格式：
+    # 1. {"accounts": [...]} - 标准导出格式
+    # 2. [...] - 简化数组格式（直接包含凭证）
+    if isinstance(body, list):
+        # 简化格式：直接是账号数组
+        accounts_data = body
+    else:
+        # 标准格式：包含 accounts 字段
+        accounts_data = body.get("accounts", [])
+    
     imported = 0
     errors = []
     
     for acc_data in accounts_data:
         try:
-            creds = acc_data.get("credentials", {})
-            if not creds.get("accessToken"):
-                errors.append(f"{acc_data.get('name', '未知')}: 缺少 accessToken")
+            # 支持两种凭证格式：
+            # 1. {"credentials": {...}} - 标准格式
+            # 2. 直接包含 accessToken 等字段 - 简化格式
+            if "credentials" in acc_data:
+                creds = acc_data.get("credentials", {})
+            else:
+                # 简化格式：直接使用 acc_data 作为凭证
+                creds = acc_data
+            
+            if not creds.get("accessToken") and not creds.get("refreshToken"):
+                errors.append(f"{acc_data.get('name', '未知')}: 缺少 accessToken 和 refreshToken")
                 continue
+            
+            # 自动检测认证方式
+            # 如果有 clientId 和 clientSecret，使用 IdC 认证
+            # 否则使用 Social 认证
+            auth_method = creds.get("authMethod")
+            if not auth_method:
+                if creds.get("clientId") and creds.get("clientSecret"):
+                    auth_method = "idc"
+                    print(f"[导入] 检测到 IdC 认证凭证")
+                else:
+                    auth_method = "social"
+                    print(f"[导入] 检测到 Social 认证凭证")
+            
+            # 如果没有 expiresAt，设置为当前时间（标记为已过期，需要刷新）
+            expires_at = creds.get("expiresAt")
+            if not expires_at:
+                # 设置为已过期，触发自动刷新
+                expires_at = (datetime.now(timezone.utc) - timedelta(hours=1)).isoformat()
             
             # 保存凭证到文件
             file_path = await save_credentials_to_file({
                 "accessToken": creds.get("accessToken"),
                 "refreshToken": creds.get("refreshToken"),
-                "expiresAt": creds.get("expiresAt"),
+                "expiresAt": expires_at,
                 "region": creds.get("region", "us-east-1"),
-                "authMethod": creds.get("authMethod", "social"),
+                "authMethod": auth_method,
                 "clientId": creds.get("clientId"),
                 "clientSecret": creds.get("clientSecret"),
+                "profileArn": creds.get("profileArn"),  # 可选，没有也能工作
+                "provider": creds.get("provider", "BuilderId"),
+                "machineId": creds.get("machineId", ""),
             }, f"imported-{uuid.uuid4().hex[:8]}")
             
             # 添加账号
             account = Account(
                 id=uuid.uuid4().hex[:8],
-                name=acc_data.get("name", "导入账号"),
+                name=acc_data.get("name", f"导入账号-{creds.get('region', 'unknown')}"),
                 token_path=file_path,
                 enabled=acc_data.get("enabled", True)
             )
             state.accounts.append(account)
             account.load_credentials()
+            
+            # 如果有 refreshToken，尝试立即刷新
+            if creds.get("refreshToken") and account.credentials:
+                try:
+                    refresher = TokenRefresher(account.credentials)
+                    success, result = await refresher.refresh()
+                    if success:
+                        account.credentials.save_to_file(file_path)
+                        print(f"[导入] 账号 {account.name} token 刷新成功")
+                    else:
+                        print(f"[导入] 账号 {account.name} token 刷新失败: {result}")
+                        errors.append(f"{account.name}: token 刷新失败 - {result}，可能需要重新登录")
+                except Exception as e:
+                    print(f"[导入] 账号 {account.name} token 刷新异常: {e}")
+                    errors.append(f"{account.name}: token 刷新异常 - {str(e)}")
+            
             imported += 1
         except Exception as e:
             errors.append(f"{acc_data.get('name', '未知')}: {str(e)}")
