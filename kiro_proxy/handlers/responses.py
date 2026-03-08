@@ -17,6 +17,7 @@ from ..core.history_manager import HistoryManager, get_history_config
 from ..core.error_handler import classify_error, ErrorType, format_error_log
 from ..core.rate_limiter import get_rate_limiter
 from ..kiro_api import build_headers, build_kiro_request, parse_event_stream, parse_event_stream_full, is_quota_exceeded_error
+from ..network import get_http_client
 
 
 def _convert_responses_input_to_kiro(input_data, instructions: str = None):
@@ -409,10 +410,10 @@ async def handle_responses(request: Request):
     async def api_caller(prompt: str) -> str:
         req = build_kiro_request(prompt, "claude-haiku-4.5", [])
         try:
-            async with httpx.AsyncClient(verify=False, timeout=60) as client:
-                resp = await client.post(KIRO_API_URL, json=req, headers=headers)
-                if resp.status_code == 200:
-                    return parse_event_stream(resp.content)
+            client = get_http_client()
+            resp = await client.post(KIRO_API_URL, json=req, headers=headers, timeout=60)
+            if resp.status_code == 200:
+                return parse_event_stream(resp.content)
         except Exception as e:
             print(f"[Responses] Summary API 调用失败: {e}")
         return ""
@@ -515,17 +516,17 @@ async def handle_responses(request: Request):
         return await _handle_stream(kiro_request, headers, account, model, log_id, start_time)
     
     # 非流式
-    async with httpx.AsyncClient(verify=False, timeout=120) as client:
-        resp = await client.post(KIRO_API_URL, json=kiro_request, headers=headers)
-        if resp.status_code != 200:
-            raise HTTPException(resp.status_code, resp.text)
-        
-        result = parse_event_stream_full(resp.content)
-        account.request_count += 1
-        account.last_used = time.time()
-        get_rate_limiter().record_request(account.id)
-        
-        return _build_response(result, model, log_id)
+    client = get_http_client()
+    resp = await client.post(KIRO_API_URL, json=kiro_request, headers=headers, timeout=120)
+    if resp.status_code != 200:
+        raise HTTPException(resp.status_code, resp.text)
+    
+    result = parse_event_stream_full(resp.content)
+    account.request_count += 1
+    account.last_used = time.time()
+    get_rate_limiter().record_request(account.id)
+    
+    return _build_response(result, model, log_id)
 
 
 def _build_response(result: dict, model: str, response_id: str) -> dict:
@@ -550,6 +551,9 @@ def _build_response(result: dict, model: str, response_id: str) -> dict:
             "arguments": json.dumps(tool_use.get("input", {}))
         })
     
+    input_tokens = result.get("input_tokens", 0)
+    output_tokens = result.get("output_tokens", 0)
+    
     return {
         "id": f"resp_{response_id}",
         "object": "response",
@@ -557,7 +561,11 @@ def _build_response(result: dict, model: str, response_id: str) -> dict:
         "status": "completed",
         "model": model,
         "output": output,
-        "usage": {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0}
+        "usage": {
+            "input_tokens": input_tokens,
+            "output_tokens": output_tokens,
+            "total_tokens": input_tokens + output_tokens
+        }
     }
 
 
@@ -584,52 +592,52 @@ async def _handle_stream(kiro_request, headers, account, model, log_id, start_ti
         print(f"[Responses] Request: model={model}, log_id={log_id}")
         
         try:
-            async with httpx.AsyncClient(verify=False, timeout=300) as client:
-                async with client.stream("POST", KIRO_API_URL, json=kiro_request, headers=headers) as response:
+            client = get_http_client()
+            async with client.stream("POST", KIRO_API_URL, json=kiro_request, headers=headers, timeout=300) as response:
+                
+                if response.status_code != 200:
+                    error_text = await response.aread()
+                    error_msg = error_text.decode()[:500]
+                    print(f"[Responses] Kiro error: {response.status_code} - {error_msg[:200]}")
                     
-                    if response.status_code != 200:
-                        error_text = await response.aread()
-                        error_msg = error_text.decode()[:500]
-                        print(f"[Responses] Kiro error: {response.status_code} - {error_msg[:200]}")
+                    # 打印更多调试信息
+                    if response.status_code == 400:
+                        cs = kiro_request.get("conversationState", {})
+                        hist = cs.get("history", [])
+                        print(f"[Responses] 400 Debug: history_len={len(hist)}")
+                        if hist:
+                            # 检查每条 history 的详细结构
+                            for i, h in enumerate(hist[:5]):  # 只打印前5条
+                                if "userInputMessage" in h:
+                                    uim = h["userInputMessage"]
+                                    has_ctx = "userInputMessageContext" in uim
+                                    has_tr = has_ctx and "toolResults" in uim.get("userInputMessageContext", {})
+                                    content_len = len(uim.get("content", ""))
+                                    uim_keys = list(uim.keys())
+                                    print(f"[Responses]   hist[{i}]: user, keys={uim_keys}, content_len={content_len}, has_toolResults={has_tr}")
+                                elif "assistantResponseMessage" in h:
+                                    arm = h["assistantResponseMessage"]
+                                    arm_keys = list(arm.keys())
+                                    has_tu = "toolUses" in arm
+                                    tu_count = len(arm.get("toolUses", []) or []) if has_tu else 0
+                                    content_len = len(arm.get("content", "") or "")
+                                    print(f"[Responses]   hist[{i}]: assistant, keys={arm_keys}, content_len={content_len}, has_toolUses={has_tu}, toolUses_count={tu_count}")
+                                else:
+                                    print(f"[Responses]   hist[{i}]: UNKNOWN keys={list(h.keys())}")
+                            if len(hist) > 5:
+                                print(f"[Responses]   ... ({len(hist) - 5} more)")
                         
-                        # 打印更多调试信息
-                        if response.status_code == 400:
-                            cs = kiro_request.get("conversationState", {})
-                            hist = cs.get("history", [])
-                            print(f"[Responses] 400 Debug: history_len={len(hist)}")
-                            if hist:
-                                # 检查每条 history 的详细结构
-                                for i, h in enumerate(hist[:5]):  # 只打印前5条
-                                    if "userInputMessage" in h:
-                                        uim = h["userInputMessage"]
-                                        has_ctx = "userInputMessageContext" in uim
-                                        has_tr = has_ctx and "toolResults" in uim.get("userInputMessageContext", {})
-                                        content_len = len(uim.get("content", ""))
-                                        uim_keys = list(uim.keys())
-                                        print(f"[Responses]   hist[{i}]: user, keys={uim_keys}, content_len={content_len}, has_toolResults={has_tr}")
-                                    elif "assistantResponseMessage" in h:
-                                        arm = h["assistantResponseMessage"]
-                                        arm_keys = list(arm.keys())
-                                        has_tu = "toolUses" in arm
-                                        tu_count = len(arm.get("toolUses", []) or []) if has_tu else 0
-                                        content_len = len(arm.get("content", "") or "")
-                                        print(f"[Responses]   hist[{i}]: assistant, keys={arm_keys}, content_len={content_len}, has_toolUses={has_tu}, toolUses_count={tu_count}")
-                                    else:
-                                        print(f"[Responses]   hist[{i}]: UNKNOWN keys={list(h.keys())}")
-                                if len(hist) > 5:
-                                    print(f"[Responses]   ... ({len(hist) - 5} more)")
-                            
-                            # 打印 currentMessage 结构
-                            cm = cs.get("currentMessage", {})
-                            if "userInputMessage" in cm:
-                                uim = cm["userInputMessage"]
-                                print(f"[Responses] currentMessage: keys={list(uim.keys())}, content_len={len(uim.get('content', ''))}")
-                                if "userInputMessageContext" in uim:
-                                    ctx = uim["userInputMessageContext"]
-                                    print(f"[Responses]   context keys={list(ctx.keys())}")
-                                    if "toolResults" in ctx:
-                                        print(f"[Responses]   toolResults count={len(ctx['toolResults'])}")
-                                    if "tools" in ctx:
+                        # 打印 currentMessage 结构
+                        cm = cs.get("currentMessage", {})
+                        if "userInputMessage" in cm:
+                            uim = cm["userInputMessage"]
+                            print(f"[Responses] currentMessage: keys={list(uim.keys())}, content_len={len(uim.get('content', ''))}")
+                            if "userInputMessageContext" in uim:
+                                ctx = uim["userInputMessageContext"]
+                                print(f"[Responses]   context keys={list(ctx.keys())}")
+                                if "toolResults" in ctx:
+                                    print(f"[Responses]   toolResults count={len(ctx['toolResults'])}")
+                                if "tools" in ctx:
                                         print(f"[Responses]   tools count={len(ctx['tools'])}")
                         
                         error_occurred = True

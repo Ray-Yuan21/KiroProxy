@@ -4,6 +4,7 @@ import uuid
 import time
 import asyncio
 import httpx
+import os
 from fastapi import Request, HTTPException
 from fastapi.responses import StreamingResponse
 
@@ -22,6 +23,9 @@ from ..converters import (
     convert_kiro_response_to_anthropic,
     extract_images_from_content
 )
+from ..optimization.parser import FastEventStreamParser
+from ..optimization.builder import SSEEventBuilder
+from ..network import get_http_client
 
 
 def _extract_text_from_content(content) -> str:
@@ -102,10 +106,10 @@ async def _call_kiro_for_summary(prompt: str, account, headers: dict) -> str:
     """调用 Kiro API 生成摘要（内部使用）"""
     kiro_request = build_kiro_request(prompt, "claude-haiku-4.5", [])  # 用快速模型生成摘要
     try:
-        async with httpx.AsyncClient(verify=False, timeout=60) as client:
-            resp = await client.post(KIRO_API_URL, json=kiro_request, headers=headers)
-            if resp.status_code == 200:
-                return parse_event_stream(resp.content)
+        client = get_http_client()
+        resp = await client.post(KIRO_API_URL, json=kiro_request, headers=headers, timeout=60)
+        if resp.status_code == 200:
+            return parse_event_stream(resp.content)
     except Exception as e:
         print(f"[Summary] API 调用失败: {e}")
     return ""
@@ -207,9 +211,227 @@ async def handle_messages(request: Request):
     kiro_request = build_kiro_request(user_content, model, history, kiro_tools, images, tool_results)
     
     if stream:
-        return await _handle_stream(kiro_request, headers, account, model, log_id, start_time, session_id, flow_id, history, user_content, kiro_tools, images, tool_results, history_manager)
+        # 检查是否使用优化的流式处理
+        if _should_use_optimized_stream(model):
+            return await _handle_stream_optimized(kiro_request, headers, account, model, log_id, start_time, session_id, flow_id, history, user_content, kiro_tools, images, tool_results, history_manager)
+        else:
+            return await _handle_stream(kiro_request, headers, account, model, log_id, start_time, session_id, flow_id, history, user_content, kiro_tools, images, tool_results, history_manager)
     else:
         return await _handle_non_stream(kiro_request, headers, account, model, log_id, start_time, session_id, flow_id, history, user_content, kiro_tools, images, tool_results, history_manager)
+
+
+def _should_use_optimized_stream(model: str) -> bool:
+    """判断是否使用优化的流式处理
+    
+    Args:
+        model: 模型名称
+        
+    Returns:
+        是否使用优化版本
+    """
+    # 通过环境变量控制，默认启用
+    return os.getenv("ENABLE_STREAM_OPTIMIZATION", "true").lower() == "true"
+
+
+async def _handle_stream_optimized(kiro_request, headers, account, model, log_id, start_time, session_id=None, flow_id=None, history=None, user_content="", kiro_tools=None, images=None, tool_results=None, history_manager=None):
+    """优化的流式响应处理器
+    
+    使用 FastEventStreamParser 和 SSEEventBuilder 降低 token 延迟。
+    """
+    
+    async def generate():
+        nonlocal kiro_request, history
+        current_account = account
+        retry_count = 0
+        max_retries = 2
+        full_content = ""
+        
+        # 实例化优化的解析器和构造器
+        parser = FastEventStreamParser()
+        builder = SSEEventBuilder()
+        
+        while retry_count <= max_retries:
+            try:
+                client = get_http_client()
+                async with client.stream("POST", KIRO_API_URL, json=kiro_request, headers=headers, timeout=300) as response:
+                        
+                        # 处理配额超限
+                        if response.status_code == 429 or is_quota_exceeded_error(response.status_code, ""):
+                            current_account.mark_quota_exceeded("Rate limited (stream)")
+                            
+                            # 尝试切换账号
+                            next_account = state.get_next_available_account(current_account.id)
+                            if next_account and retry_count < max_retries:
+                                print(f"[StreamOpt] 配额超限，切换账号: {current_account.id} -> {next_account.id}")
+                                current_account = next_account
+                                token = current_account.get_token()
+                                headers["Authorization"] = f"Bearer {token}"
+                                retry_count += 1
+                                continue
+                            
+                            if flow_id:
+                                flow_monitor.fail_flow(flow_id, "rate_limit_error", "All accounts rate limited", 429)
+                            yield f'data: {{"type":"error","error":{{"type":"rate_limit_error","message":"All accounts rate limited"}}}}\n\n'
+                            return
+
+                        # 处理可重试的服务端错误
+                        if is_retryable_error(response.status_code):
+                            if retry_count < max_retries:
+                                print(f"[StreamOpt] 服务端错误 {response.status_code}，重试 {retry_count + 1}/{max_retries}")
+                                retry_count += 1
+                                await asyncio.sleep(0.5 * (2 ** retry_count))
+                                continue
+                            if flow_id:
+                                flow_monitor.fail_flow(flow_id, "api_error", "Server error after retries", response.status_code)
+                            yield f'data: {{"type":"error","error":{{"type":"api_error","message":"Server error after retries"}}}}\n\n'
+                            return
+
+                        if response.status_code != 200:
+                            error_text = await response.aread()
+                            error_str = error_text.decode()
+                            print(f"[StreamOpt] Kiro API Error {response.status_code}: {error_str[:500]}")
+                            
+                            # 使用统一的错误处理
+                            http_status, error_type, error_msg, error_obj = _handle_kiro_error(
+                                response.status_code, error_str, current_account
+                            )
+                            
+                            # 账号封禁 - 尝试切换账号
+                            if error_obj.should_switch_account:
+                                next_account = state.get_next_available_account(current_account.id)
+                                if next_account and retry_count < max_retries:
+                                    print(f"[StreamOpt] 切换账号: {current_account.id} -> {next_account.id}")
+                                    current_account = next_account
+                                    headers["Authorization"] = f"Bearer {current_account.get_token()}"
+                                    retry_count += 1
+                                    continue
+                            
+                            # 检查是否为内容长度超限错误，尝试截断重试
+                            if error_obj.type == ErrorType.CONTENT_TOO_LONG:
+                                history_chars, user_chars, total_chars = history_manager.estimate_request_chars(
+                                    history, user_content
+                                )
+                                print(f"[StreamOpt] 内容长度超限: history={history_chars} chars, user={user_chars} chars, total={total_chars} chars")
+                                async def api_caller(prompt: str) -> str:
+                                    return await _call_kiro_for_summary(prompt, current_account, headers)
+                                truncated_history, should_retry = await history_manager.handle_length_error_async(
+                                    history, retry_count, api_caller
+                                )
+                                if should_retry:
+                                    print(f"[StreamOpt] 内容长度超限，{history_manager.truncate_info}")
+                                    history = truncated_history
+                                    # 重新构建请求
+                                    kiro_request = build_kiro_request(user_content, model, history, kiro_tools, images, tool_results)
+                                    retry_count += 1
+                                    continue
+                            
+                            if flow_id:
+                                flow_monitor.fail_flow(flow_id, error_type, error_msg, response.status_code, error_str)
+                            yield f'data: {{"type":"error","error":{{"type":"{error_type}","message":"{error_msg}"}}}}\n\n'
+                            return
+
+                        # 标记开始流式传输
+                        if flow_id:
+                            flow_monitor.start_streaming(flow_id)
+
+                        # 正常处理响应
+                        msg_id = f"msg_{log_id}"
+                        yield f'data: {{"type":"message_start","message":{{"id":"{msg_id}","type":"message","role":"assistant","content":[],"model":"{model}","stop_reason":null,"stop_sequence":null,"usage":{{"input_tokens":0,"output_tokens":0}}}}}}\n\n'
+                        yield f'data: {{"type":"content_block_start","index":0,"content_block":{{"type":"text","text":""}}}}\n\n'
+
+                        full_response = b""
+                        tool_uses_buffer = []
+
+                        # 使用优化的解析器处理流式数据
+                        async for chunk in response.aiter_bytes():
+                            full_response += chunk
+
+                            try:
+                                # 立即解析，不等待完整 chunk
+                                for event in parser.feed(chunk):
+                                    if event.is_content_delta:
+                                        # 快速路径：立即输出
+                                        sse_event = builder.build_content_delta(event.content)
+                                        yield sse_event
+                                        
+                                        full_content += event.content
+                                        if flow_id:
+                                            flow_monitor.add_chunk(flow_id, event.content)
+                                    elif event.event_type == 'toolUseEvent':
+                                        # 慢速路径：缓存 tool use 事件
+                                        tool_uses_buffer.append(event)
+                            except Exception as e:
+                                # 解析错误，记录日志但继续处理
+                                print(f"[StreamOpt] Parse error: {e}, falling back for this chunk")
+
+                        # 使用完整解析获取 tool_uses 和 stop_reason
+                        result = parse_event_stream_full(full_response)
+
+                        yield f'data: {{"type":"content_block_stop","index":0}}\n\n'
+
+                        if result["tool_uses"]:
+                            for i, tool_use in enumerate(result["tool_uses"], 1):
+                                yield f'data: {{"type":"content_block_start","index":{i},"content_block":{{"type":"tool_use","id":"{tool_use["id"]}","name":"{tool_use["name"]}","input":{{}}}}}}\n\n'
+                                yield f'data: {{"type":"content_block_delta","index":{i},"delta":{{"type":"input_json_delta","partial_json":{json.dumps(json.dumps(tool_use["input"]))}}}}}\n\n'
+                                yield f'data: {{"type":"content_block_stop","index":{i}}}\n\n'
+
+                        stop_reason = result["stop_reason"]
+                        output_tokens = result.get("output_tokens", 0)
+                        yield f'data: {{"type":"message_delta","delta":{{"stop_reason":"{stop_reason}","stop_sequence":null}},"usage":{{"output_tokens":{output_tokens}}}}}\n\n'
+                        yield f'data: {{"type":"message_stop"}}\n\n'
+
+                        # 完成 Flow
+                        if flow_id:
+                            flow_monitor.complete_flow(
+                                flow_id,
+                                status_code=200,
+                                content=full_content,
+                                tool_calls=result.get("tool_uses", []),
+                                stop_reason=stop_reason,
+                                usage=TokenUsage(
+                                    input_tokens=result.get("input_tokens", 0),
+                                    output_tokens=result.get("output_tokens", 0),
+                                ),
+                            )
+
+                        current_account.request_count += 1
+                        current_account.last_used = time.time()
+                        get_rate_limiter().record_request(current_account.id)
+                        return
+
+            except httpx.TimeoutException:
+                if retry_count < max_retries:
+                    print(f"[StreamOpt] 请求超时，重试 {retry_count + 1}/{max_retries}")
+                    retry_count += 1
+                    await asyncio.sleep(0.5 * (2 ** retry_count))
+                    continue
+                if flow_id:
+                    flow_monitor.fail_flow(flow_id, "timeout_error", "Request timeout after retries", 408)
+                yield f'data: {{"type":"error","error":{{"type":"api_error","message":"Request timeout after retries"}}}}\n\n'
+                return
+            except httpx.ConnectError:
+                if retry_count < max_retries:
+                    print(f"[StreamOpt] 连接错误，重试 {retry_count + 1}/{max_retries}")
+                    retry_count += 1
+                    await asyncio.sleep(0.5 * (2 ** retry_count))
+                    continue
+                if flow_id:
+                    flow_monitor.fail_flow(flow_id, "connection_error", "Connection error after retries", 502)
+                yield f'data: {{"type":"error","error":{{"type":"api_error","message":"Connection error after retries"}}}}\n\n'
+                return
+            except Exception as e:
+                # 检查是否为可重试的网络错误
+                if is_retryable_error(None, e) and retry_count < max_retries:
+                    print(f"[StreamOpt] 网络错误，重试 {retry_count + 1}/{max_retries}: {type(e).__name__}")
+                    retry_count += 1
+                    await asyncio.sleep(0.5 * (2 ** retry_count))
+                    continue
+                if flow_id:
+                    flow_monitor.fail_flow(flow_id, "api_error", str(e), 500)
+                yield f'data: {{"type":"error","error":{{"type":"api_error","message":"{str(e)}"}}}}\n\n'
+                return
+
+    return StreamingResponse(generate(), media_type="text/event-stream")
 
 
 async def _handle_stream(kiro_request, headers, account, model, log_id, start_time, session_id=None, flow_id=None, history=None, user_content="", kiro_tools=None, images=None, tool_results=None, history_manager=None):
@@ -224,8 +446,8 @@ async def _handle_stream(kiro_request, headers, account, model, log_id, start_ti
         
         while retry_count <= max_retries:
             try:
-                async with httpx.AsyncClient(verify=False, timeout=300) as client:
-                    async with client.stream("POST", KIRO_API_URL, json=kiro_request, headers=headers) as response:
+                client = get_http_client()
+                async with client.stream("POST", KIRO_API_URL, json=kiro_request, headers=headers, timeout=300) as response:
                         
                         # 处理配额超限
                         if response.status_code == 429 or is_quota_exceeded_error(response.status_code, ""):
@@ -385,7 +607,8 @@ async def _handle_stream(kiro_request, headers, account, model, log_id, start_ti
                                 yield f'data: {{"type":"content_block_stop","index":{i}}}\n\n'
 
                         stop_reason = result["stop_reason"]
-                        yield f'data: {{"type":"message_delta","delta":{{"stop_reason":"{stop_reason}","stop_sequence":null}},"usage":{{"output_tokens":100}}}}\n\n'
+                        output_tokens = result.get("output_tokens", 0)
+                        yield f'data: {{"type":"message_delta","delta":{{"stop_reason":"{stop_reason}","stop_sequence":null}},"usage":{{"output_tokens":{output_tokens}}}}}\n\n'
                         yield f'data: {{"type":"message_stop"}}\n\n'
 
                         # 完成 Flow
@@ -455,99 +678,99 @@ async def _handle_non_stream(kiro_request, headers, account, model, log_id, star
 
     for retry in range(max_retries + 1):
         try:
-            async with httpx.AsyncClient(verify=False, timeout=300) as client:
-                response = await client.post(KIRO_API_URL, json=kiro_request, headers=headers)
-                status_code = response.status_code
+            client = get_http_client()
+            response = await client.post(KIRO_API_URL, json=kiro_request, headers=headers, timeout=300)
+            status_code = response.status_code
 
-                # 处理配额超限
-                if response.status_code == 429 or is_quota_exceeded_error(response.status_code, response.text):
-                    current_account.mark_quota_exceeded("Rate limited")
-                    
-                    # 尝试切换账号
+            # 处理配额超限
+            if response.status_code == 429 or is_quota_exceeded_error(response.status_code, response.text):
+                current_account.mark_quota_exceeded("Rate limited")
+                
+                # 尝试切换账号
+                next_account = state.get_next_available_account(current_account.id)
+                if next_account and retry < max_retries:
+                    print(f"[NonStream] 配额超限，切换账号: {current_account.id} -> {next_account.id}")
+                    current_account = next_account
+                    token = current_account.get_token()
+                    creds = current_account.get_credentials()
+                    headers["Authorization"] = f"Bearer {token}"
+                    continue
+                
+                if flow_id:
+                    flow_monitor.fail_flow(flow_id, "rate_limit_error", "All accounts rate limited", 429)
+                raise HTTPException(429, "All accounts rate limited")
+
+            # 处理可重试的服务端错误
+            if is_retryable_error(response.status_code):
+                if retry < max_retries:
+                    print(f"[NonStream] 服务端错误 {response.status_code}，重试 {retry + 1}/{max_retries}")
+                    await retry_ctx.wait()
+                    continue
+                if flow_id:
+                    flow_monitor.fail_flow(flow_id, "api_error", f"Server error after {max_retries} retries", response.status_code)
+                raise HTTPException(response.status_code, f"Server error after {max_retries} retries")
+
+            if response.status_code != 200:
+                error_msg = response.text
+                print(f"[NonStream] Kiro API Error {response.status_code}: {error_msg[:500]}")
+                
+                # 使用统一的错误处理
+                status, error_type, error_message, error_obj = _handle_kiro_error(
+                    response.status_code, error_msg, current_account
+                )
+                
+                # 账号封禁或配额超限 - 尝试切换账号
+                if error_obj.should_switch_account:
                     next_account = state.get_next_available_account(current_account.id)
                     if next_account and retry < max_retries:
-                        print(f"[NonStream] 配额超限，切换账号: {current_account.id} -> {next_account.id}")
+                        print(f"[NonStream] 切换账号: {current_account.id} -> {next_account.id}")
                         current_account = next_account
-                        token = current_account.get_token()
-                        creds = current_account.get_credentials()
-                        headers["Authorization"] = f"Bearer {token}"
+                        headers["Authorization"] = f"Bearer {current_account.get_token()}"
                         continue
-                    
-                    if flow_id:
-                        flow_monitor.fail_flow(flow_id, "rate_limit_error", "All accounts rate limited", 429)
-                    raise HTTPException(429, "All accounts rate limited")
-
-                # 处理可重试的服务端错误
-                if is_retryable_error(response.status_code):
-                    if retry < max_retries:
-                        print(f"[NonStream] 服务端错误 {response.status_code}，重试 {retry + 1}/{max_retries}")
-                        await retry_ctx.wait()
-                        continue
-                    if flow_id:
-                        flow_monitor.fail_flow(flow_id, "api_error", f"Server error after {max_retries} retries", response.status_code)
-                    raise HTTPException(response.status_code, f"Server error after {max_retries} retries")
-
-                if response.status_code != 200:
-                    error_msg = response.text
-                    print(f"[NonStream] Kiro API Error {response.status_code}: {error_msg[:500]}")
-                    
-                    # 使用统一的错误处理
-                    status, error_type, error_message, error_obj = _handle_kiro_error(
-                        response.status_code, error_msg, current_account
+                
+                # 检查是否为内容长度超限错误，尝试截断重试
+                if error_obj.type == ErrorType.CONTENT_TOO_LONG and history_manager:
+                    history_chars, user_chars, total_chars = history_manager.estimate_request_chars(
+                        history, user_content
                     )
-                    
-                    # 账号封禁或配额超限 - 尝试切换账号
-                    if error_obj.should_switch_account:
-                        next_account = state.get_next_available_account(current_account.id)
-                        if next_account and retry < max_retries:
-                            print(f"[NonStream] 切换账号: {current_account.id} -> {next_account.id}")
-                            current_account = next_account
-                            headers["Authorization"] = f"Bearer {current_account.get_token()}"
-                            continue
-                    
-                    # 检查是否为内容长度超限错误，尝试截断重试
-                    if error_obj.type == ErrorType.CONTENT_TOO_LONG and history_manager:
-                        history_chars, user_chars, total_chars = history_manager.estimate_request_chars(
-                            history, user_content
-                        )
-                        print(f"[NonStream] 内容长度超限: history={history_chars} chars, user={user_chars} chars, total={total_chars} chars")
-                        async def api_caller(prompt: str) -> str:
-                            return await _call_kiro_for_summary(prompt, current_account, headers)
-                        truncated_history, should_retry = await history_manager.handle_length_error_async(
-                            history, retry, api_caller
-                        )
-                        if should_retry:
-                            print(f"[NonStream] 内容长度超限，{history_manager.truncate_info}")
-                            history = truncated_history
-                            kiro_request = build_kiro_request(user_content, model, history, kiro_tools, images, tool_results)
-                            continue
-                        else:
-                            print(f"[NonStream] 内容长度超限但未重试: retry={retry}/{max_retries}")
-                    
-                    if flow_id:
-                        flow_monitor.fail_flow(flow_id, error_type, error_message, status, error_msg)
-                    raise HTTPException(status, error_message)
-
-                result = parse_event_stream_full(response.content)
-                current_account.request_count += 1
-                current_account.last_used = time.time()
-                get_rate_limiter().record_request(current_account.id)
-
-                # 完成 Flow
+                    print(f"[NonStream] 内容长度超限: history={history_chars} chars, user={user_chars} chars, total={total_chars} chars")
+                    async def api_caller(prompt: str) -> str:
+                        return await _call_kiro_for_summary(prompt, current_account, headers)
+                    truncated_history, should_retry = await history_manager.handle_length_error_async(
+                        history, retry, api_caller
+                    )
+                    if should_retry:
+                        print(f"[NonStream] 内容长度超限，{history_manager.truncate_info}")
+                        history = truncated_history
+                        kiro_request = build_kiro_request(user_content, model, history, kiro_tools, images, tool_results)
+                        continue
+                    else:
+                        print(f"[NonStream] 内容长度超限但未重试: retry={retry}/{max_retries}")
+                
                 if flow_id:
-                    flow_monitor.complete_flow(
-                        flow_id,
-                        status_code=200,
-                        content=result.get("text", ""),
-                        tool_calls=result.get("tool_uses", []),
-                        stop_reason=result.get("stop_reason", ""),
-                        usage=TokenUsage(
-                            input_tokens=result.get("input_tokens", 0),
-                            output_tokens=result.get("output_tokens", 0),
-                        ),
-                    )
+                    flow_monitor.fail_flow(flow_id, error_type, error_message, status, error_msg)
+                raise HTTPException(status, error_message)
 
-                return convert_kiro_response_to_anthropic(result, model, f"msg_{log_id}")
+            result = parse_event_stream_full(response.content)
+            current_account.request_count += 1
+            current_account.last_used = time.time()
+            get_rate_limiter().record_request(current_account.id)
+
+            # 完成 Flow
+            if flow_id:
+                flow_monitor.complete_flow(
+                    flow_id,
+                    status_code=200,
+                    content=result.get("text", ""),
+                    tool_calls=result.get("tool_uses", []),
+                    stop_reason=result.get("stop_reason", ""),
+                    usage=TokenUsage(
+                        input_tokens=result.get("input_tokens", 0),
+                        output_tokens=result.get("output_tokens", 0),
+                    ),
+                )
+
+            return convert_kiro_response_to_anthropic(result, model, f"msg_{log_id}")
 
         except HTTPException:
             raise

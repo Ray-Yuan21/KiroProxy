@@ -256,21 +256,27 @@ def convert_anthropic_messages_to_kiro(messages: List[dict], system="") -> Tuple
     Returns:
         (user_content, history, tool_results)
     """
+    import os
+    
     history = []
     user_content = ""
     current_tool_results = []
     
+    # 检查是否应该过滤 system 提示词
+    filter_system = os.getenv("FILTER_SYSTEM_PROMPT", "false").lower() == "true"
+    
     # 处理 system
     system_text = ""
-    if isinstance(system, list):
-        for block in system:
-            if isinstance(block, dict) and block.get("type") == "text":
-                system_text += block.get("text", "") + "\n"
-            elif isinstance(block, str):
-                system_text += block + "\n"
-        system_text = system_text.strip()
-    elif isinstance(system, str):
-        system_text = system
+    if not filter_system:  # 只有在不过滤时才处理 system
+        if isinstance(system, list):
+            for block in system:
+                if isinstance(block, dict) and block.get("type") == "text":
+                    system_text += block.get("text", "") + "\n"
+                elif isinstance(block, str):
+                    system_text += block + "\n"
+            system_text = system_text.strip()
+        elif isinstance(system, str):
+            system_text = system
     
     for i, msg in enumerate(messages):
         role = msg.get("role", "")
@@ -411,7 +417,10 @@ def convert_kiro_response_to_anthropic(result: dict, model: str, msg_id: str) ->
         "model": model,
         "stop_reason": result["stop_reason"],
         "stop_sequence": None,
-        "usage": {"input_tokens": 100, "output_tokens": 100}
+        "usage": {
+            "input_tokens": result.get("input_tokens", 0),
+            "output_tokens": result.get("output_tokens", 0)
+        }
     }
 
 
@@ -488,6 +497,11 @@ def convert_openai_messages_to_kiro(
     Returns:
         (user_content, history, tool_results, kiro_tools)
     """
+    import os
+    
+    # 检查是否应该过滤 system 提示词
+    filter_system = os.getenv("FILTER_SYSTEM_PROMPT", "false").lower() == "true"
+    
     system_content = ""
     history = []
     user_content = ""
@@ -511,7 +525,8 @@ def convert_openai_messages_to_kiro(
             content = ""
         
         if role == "system":
-            system_content = content + tool_instruction
+            if not filter_system:  # 只有在不过滤时才保存 system
+                system_content = content + tool_instruction
         
         elif role == "tool":
             # OpenAI tool 角色消息 -> Kiro toolResults
@@ -548,8 +563,8 @@ def convert_openai_messages_to_kiro(
                     })
                 pending_tool_results = []
             
-            # 合并 system prompt
-            if system_content and not history:
+            # 合并 system prompt（只有在不过滤时）
+            if system_content and not history and not filter_system:
                 content = f"{system_content}\n\n{content}"
             
             if is_last:
@@ -687,9 +702,9 @@ def convert_kiro_response_to_openai(result: dict, model: str, msg_id: str) -> di
             "finish_reason": finish_reason
         }],
         "usage": {
-            "prompt_tokens": 100,
-            "completion_tokens": 100,
-            "total_tokens": 200
+            "prompt_tokens": result.get("input_tokens", 0),
+            "completion_tokens": result.get("output_tokens", 0),
+            "total_tokens": result.get("input_tokens", 0) + result.get("output_tokens", 0)
         }
     }
 
@@ -757,14 +772,19 @@ def convert_gemini_contents_to_kiro(
     Returns:
         (user_content, history, tool_results, kiro_tools)
     """
+    import os
+    
+    # 检查是否应该过滤 system 提示词
+    filter_system = os.getenv("FILTER_SYSTEM_PROMPT", "false").lower() == "true"
+    
     history = []
     user_content = ""
     current_tool_results = []
     pending_tool_results = []
     
-    # 处理 system instruction
+    # 处理 system instruction（只有在不过滤时）
     system_text = ""
-    if system_instruction:
+    if not filter_system and system_instruction:
         parts = system_instruction.get("parts", [])
         system_text = " ".join(p.get("text", "") for p in parts if "text" in p)
     
@@ -839,8 +859,8 @@ def convert_gemini_contents_to_kiro(
             if tool_responses:
                 pending_tool_results.extend(tool_responses)
             
-            # 合并 system prompt
-            if system_text and not history:
+            # 合并 system prompt（只有在不过滤时）
+            if system_text and not history and not filter_system:
                 text = f"{system_text}{tool_instruction}\n\n{text}"
             
             if is_last:
@@ -959,8 +979,8 @@ def convert_kiro_response_to_gemini(result: dict, model: str) -> dict:
             "index": 0
         }],
         "usageMetadata": {
-            "promptTokenCount": 100,
-            "candidatesTokenCount": 100,
-            "totalTokenCount": 200
+            "promptTokenCount": result.get("input_tokens", 0),
+            "candidatesTokenCount": result.get("output_tokens", 0),
+            "totalTokenCount": result.get("input_tokens", 0) + result.get("output_tokens", 0)
         }
     }

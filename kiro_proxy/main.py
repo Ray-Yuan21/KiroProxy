@@ -15,6 +15,7 @@ from .handlers import anthropic, openai, gemini, admin
 from .handlers import responses as responses_handler
 from .web import get_html_page
 from .credential import generate_machine_id, get_kiro_version
+from .network import close_http_client
 
 
 def get_resource_path(relative_path: str) -> Path:
@@ -27,9 +28,12 @@ def get_resource_path(relative_path: str) -> Path:
 async def lifespan(app: FastAPI):
     """应用生命周期管理"""
     # 启动时
+    print("[Network] 初始化 HTTP 客户端池...")
     await scheduler.start()
     yield
     # 关闭时
+    print("[Network] 关闭 HTTP 客户端池...")
+    await close_http_client()
     await scheduler.stop()
 
 
@@ -282,6 +286,12 @@ async def api_detailed_stats():
 async def api_health_check():
     """手动触发健康检查"""
     return await admin.run_health_check()
+@app.get("/health")
+async def health():
+    """Simple health check endpoint"""
+    return {"status": "ok"}
+
+
 
 
 @app.get("/api/browsers")

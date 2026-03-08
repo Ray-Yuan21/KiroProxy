@@ -119,7 +119,9 @@ class KiroProvider(BaseProvider):
         result = {
             "content": [],
             "tool_uses": [],
-            "stop_reason": "end_turn"
+            "stop_reason": "end_turn",
+            "input_tokens": 0,
+            "output_tokens": 0
         }
         
         tool_input_buffer = {}
@@ -146,6 +148,8 @@ class KiroProvider(BaseProvider):
                     event_type = 'toolUseEvent'
                 elif 'assistantResponseEvent' in headers_str:
                     event_type = 'assistantResponseEvent'
+                elif 'metadataEvent' in headers_str:
+                    event_type = 'metadataEvent'
             except:
                 pass
             
@@ -156,6 +160,7 @@ class KiroProvider(BaseProvider):
                 try:
                     payload = json.loads(raw[payload_start:payload_end].decode('utf-8'))
                     
+                    # 解析内容
                     if 'assistantResponseEvent' in payload:
                         e = payload['assistantResponseEvent']
                         if 'content' in e:
@@ -163,6 +168,28 @@ class KiroProvider(BaseProvider):
                     elif 'content' in payload and event_type != 'toolUseEvent':
                         result["content"].append(payload['content'])
                     
+                    # 解析 token 统计（从 metadataEvent 或其他事件中）
+                    if event_type == 'metadataEvent' or 'metadataEvent' in payload:
+                        metadata = payload.get('metadataEvent', payload)
+                        # 尝试多种可能的字段名
+                        if 'inputTokens' in metadata:
+                            result["input_tokens"] = metadata['inputTokens']
+                        if 'outputTokens' in metadata:
+                            result["output_tokens"] = metadata['outputTokens']
+                        if 'usage' in metadata:
+                            usage = metadata['usage']
+                            result["input_tokens"] = usage.get('inputTokens', usage.get('input_tokens', 0))
+                            result["output_tokens"] = usage.get('outputTokens', usage.get('output_tokens', 0))
+                    
+                    # 也尝试从 assistantResponseEvent 中提取
+                    if 'assistantResponseEvent' in payload:
+                        e = payload['assistantResponseEvent']
+                        if 'usage' in e:
+                            usage = e['usage']
+                            result["input_tokens"] = usage.get('inputTokens', usage.get('input_tokens', result["input_tokens"]))
+                            result["output_tokens"] = usage.get('outputTokens', usage.get('output_tokens', result["output_tokens"]))
+                    
+                    # 解析工具调用
                     if event_type == 'toolUseEvent' or 'toolUseId' in payload:
                         tool_id = payload.get('toolUseId', '')
                         tool_name = payload.get('name', '')
